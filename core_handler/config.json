@@ -1,0 +1,12 @@
+{
+  "stages": [
+    {"name": "erode_stage", "callable": "erode"},
+    {"name": "gray", "callable": "rgb2gray"},
+    {"name": "blur", "callable": "gaussian"}
+  ],
+  "connections": [
+    {"from": "erode_stage", "to": ["gray"]},
+    {"from": "gray", "to": ["blur"]}
+  ],
+  "start_stage": "erode_stage"
+}

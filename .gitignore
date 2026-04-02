@@ -1,0 +1,6 @@
+*.h5
+*.csv
+*.tmp
+__pycache__/
+.ipynb_checkpoints/
+taskflow/
