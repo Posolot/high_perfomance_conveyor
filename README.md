@@ -77,6 +77,4 @@ cmake --build . --target benchmark
 - CSV-файлы с метриками
 - `order.txt`
 
-Эти файлы обычно не коммитят в репозиторий.
-
 
