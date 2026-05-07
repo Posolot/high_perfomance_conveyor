@@ -79,12 +79,4 @@ cmake --build . --target benchmark
 
 Эти файлы обычно не коммитят в репозиторий.
 
-## Примечание
 
-Если после изменения CMake или Python-скриптов бенчмарк не запускается, выполните повторную конфигурацию:
-
-```bash
-cd build
-cmake .. -DBUILD_BENCHMARK=ON
-cmake --build . --target benchmark
-```
