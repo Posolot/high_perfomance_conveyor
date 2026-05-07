@@ -1,0 +1,75 @@
+{
+  "frame": {
+    "width": 640,
+    "height": 480,
+    "channels": 1
+  },
+  "buffer_size": 250,
+  "runtime": {
+    "physical_cores": 4,
+    "logical_cpus": 8,
+    "cpu_budget": 8
+  },
+  "stages": [
+    {
+      "name": "gray_stage",
+      "callable": "rgb2gray",
+      "next": [
+        "erode_stage",
+        "blur_stage",
+        "gaussian_stage"
+      ],
+      "initial_workers": 1,
+      "min_workers": 1,
+      "max_workers": 10
+    },
+    {
+      "name": "erode_stage",
+      "callable": "erode",
+      "next": [
+        "merge_stage"
+      ],
+      "initial_workers": 1,
+      "min_workers": 1,
+      "max_workers": 10
+    },
+    {
+      "name": "blur_stage",
+      "callable": "blur",
+      "next": [
+        "merge_stage"
+      ],
+      "initial_workers": 1,
+      "min_workers": 1,
+      "max_workers": 10
+    },
+    {
+      "name": "gaussian_stage",
+      "callable": "blur",
+      "next": [
+        "merge_stage"
+      ],
+      "initial_workers": 1,
+      "min_workers": 1,
+      "max_workers": 10
+    },
+    {
+      "name": "merge_stage",
+      "callable": "merge",
+      "next": [
+        "fft_stage"
+      ],
+      "initial_workers": 1,
+      "min_workers": 1,
+      "max_workers": 10
+    },
+    {
+      "name": "fft_stage",
+      "callable": "fft",
+      "next": [],
+      "initial_workers": 2,
+      "min_workers": 2,
+      "max_workers": 10
+    }
+  ]
+}
