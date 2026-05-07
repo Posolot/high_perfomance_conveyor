@@ -14,7 +14,7 @@ test_data/frames_1920x1080.h5
 test_data/frames_2560x1440.h5
 test_data/frames_3840x2160.h5
 ```
-
+Сами файлы можно скачать в релизе /releases/download/datasets-v1/test_data.zip
 ## Сборка проекта
 
 Сборка выполняется из папки `build/`:
