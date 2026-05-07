@@ -14,7 +14,17 @@ test_data/frames_1920x1080.h5
 test_data/frames_2560x1440.h5
 test_data/frames_3840x2160.h5
 ```
-Сами файлы можно скачать в релизе /releases/download/datasets-v1/test_data.zip
+
+Сами файлы находятся в релизе
+```bash
+mkdir -p test_data
+cd test_data
+
+wget https://github.com/Posolot/high_perfomance_conveyor/releases/download/datasets-v1/test_data.zip
+
+unzip test_data.zip
+```
+
 ## Сборка проекта
 
 Сборка выполняется из папки `build/`:
