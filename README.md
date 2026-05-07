@@ -60,20 +60,6 @@ cmake --build . --target benchmark
 - аналогичные конфиги для остальных разрешений
 - файлы `.h5` в `test_data/`
 
-
-## Структура проекта
-
-```text
-high_perfomance_conveyor/
-├── configs/
-├── plugins/
-├── scripts/
-├── src/
-├── test_data/
-├── README.md
-└── build/
-```
-
 ## Результаты бенчмарка
 
 После выполнения бенчмарка в папке results появятся:
