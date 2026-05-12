@@ -166,7 +166,7 @@ if(BUILD_BENCHMARK)
             --sender $<TARGET_FILE:sender>
             --data-dir ${CMAKE_SOURCE_DIR}/test_data
             --config-dir ${CMAKE_SOURCE_DIR}/configs
-            --duration 10
+            --duration 30
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
         COMMENT "Running benchmark..."
         DEPENDS pipeline sender
