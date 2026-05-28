@@ -5,3 +5,8 @@ __pycache__/
 taskflow/
 build/
 *h5
+test_data/
+order.txt
+.idea/
+.env
+.env.local
