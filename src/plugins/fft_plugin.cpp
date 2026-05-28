@@ -1,14 +1,15 @@
 #include "plugin_api.h"
+#include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 
 static void process(cv::Mat& frame, const ProcessContext* ctx) {
-    (void)ctx; // метаданные пока не используются, но могут быть полезны в будущем
+    (void)ctx;
     if (frame.empty()) return;
-    frame.setTo(cv::Scalar(255, 255, 255));
-    if (count++ % 100 == 0) {
-        std::cerr << "[blur_plugin] process called, frame size: " 
-                  << frame.cols << "x" << frame.rows << std::endl;
-    }
+    thread_local cv::Mat float_img;
+    float_img.create(frame.rows, frame.cols, CV_32F);
+    frame.convertTo(float_img, CV_32F);
+    frame.create(float_img.rows, float_img.cols, CV_32FC2);
+    cv::dft(float_img, frame, cv::DFT_COMPLEX_OUTPUT);
 }
 
 extern "C" StagePluginV3* stage_plugin_entry() {

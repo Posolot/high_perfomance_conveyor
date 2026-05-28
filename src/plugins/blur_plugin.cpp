@@ -2,13 +2,9 @@
 #include <opencv2/imgproc.hpp>
 
 static void process(cv::Mat& frame, const ProcessContext* ctx) {
-    (void)ctx; // метаданные пока не используются, но могут быть полезны в будущем
+    (void)ctx;
     if (frame.empty()) return;
-    frame.setTo(cv::Scalar(255, 255, 255));
-    if (count++ % 100 == 0) {
-        std::cerr << "[blur_plugin] process called, frame size: " 
-                  << frame.cols << "x" << frame.rows << std::endl;
-    }
+    cv::GaussianBlur(frame, frame, {5, 5}, 1.5);
 }
 
 extern "C" StagePluginV3* stage_plugin_entry() {

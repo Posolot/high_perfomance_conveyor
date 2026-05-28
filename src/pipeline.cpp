@@ -131,17 +131,6 @@ static inline LatencyStats summarize_latency(std::vector<uint64_t> samples_ns) {
 }
 
 // ================= FRAME META =================
-struct FrameMetaInfo {
-    uint64_t frame_id = 0;
-    uint64_t trace_id = 0;
-    uint64_t split_id = 0;
-    uint16_t branch_id = 0;
-    uint16_t expected_branches = 1;
-    uint64_t created_ns = 0;
-    uint64_t queue_enter_ns = 0;
-    std::string source_stage;
-    uint64_t global_seq = 0;
-};
 
 // ================= FRAME =================
 struct Frame {
@@ -252,6 +241,11 @@ struct RuntimeConfig {
     int frame_channels = 1;
     int buffer_size = 60;
     std::vector<int> cpu_ids;
+
+    std::string ip = "127.0.0.1";
+    int port = 5558;
+    std::string protocol = "tcp";
+    std::string socket_type = "PULL";
 };
 
 struct StageSpec {
@@ -277,14 +271,12 @@ struct OrderedOutputItem {
     uint64_t global_seq = 0;
     uint64_t frame_id = 0;
     uint64_t created_ns = 0;
+    int slot = -1;   // добавлен слот
 };
 
 // ================= QUIET MODE =================
 bool g_quiet = false;
 
-constexpr size_t REORDER_CAP = 4096;
-MPMCQueue<OrderedOutputItem, REORDER_CAP> reorder_queue;
-std::atomic<int> reorder_queue_count{0};
 std::atomic<uint64_t> g_global_seq_counter{0};
 LatencyRing<LATENCY_RING_CAP> g_e2e_latency_ns;
 
@@ -305,7 +297,7 @@ inline uint64_t next_split_id() {
 // ================= PLUGIN LOADING =================
 struct LoadedPlugin {
     void* handle = nullptr;
-    const StagePluginV2* api = nullptr;
+    const StagePluginV3* api = nullptr;
 };
 
 LoadedPlugin load_plugin(const std::string& path, bool require_process, bool require_merge) {
@@ -325,8 +317,8 @@ LoadedPlugin load_plugin(const std::string& path, bool require_process, bool req
         throw std::runtime_error("plugin entry returned null: " + path);
     }
     if (p.api->abi_version != STAGE_PLUGIN_ABI_VERSION) {
-        throw std::runtime_error("plugin ABI mismatch: " + path);
-    }
+    throw std::runtime_error("plugin ABI mismatch: expected " + std::to_string(STAGE_PLUGIN_ABI_VERSION) + ", got " + std::to_string(p.api->abi_version));
+    }   
     if (require_process && !p.api->process) {
         throw std::runtime_error("plugin process() is null: " + path);
     }
@@ -393,6 +385,11 @@ struct Stage {
 
     std::mutex merge_mutex;
     std::unordered_map<uint64_t, MergeGroup> pending_merges;
+
+    // Для терминальных стадий – свой reorder buffer
+    MPMCQueue<OrderedOutputItem, 4096> output_queue;
+    std::unique_ptr<std::thread> reorder_thread;
+    std::atomic<bool> reorder_stop{false};
 };
 
 // ================= GLOBAL CONTROL =================
@@ -451,14 +448,22 @@ bool reserve_free_slots(size_t count, std::vector<int>& out) {
 
 void push_stage_slot(Stage& stage, int slot) {
     buffer[slot].meta.queue_enter_ns = steady_now_ns();
+    if (stage.name == "blur_stage") {
+        std::cout << "[push_stage_slot] pushing to " << stage.name << " slot " << slot << std::endl;
+    }
     while (!stage.queue.push(slot)) std::this_thread::yield();
     stage.queue_depth.fetch_add(1, std::memory_order_relaxed);
 }
 
 bool pop_stage_slot(Stage& stage, int& slot) {
-    if (!stage.queue.pop(slot)) return false;
-    stage.queue_depth.fetch_sub(1, std::memory_order_relaxed);
-    return true;
+    bool result = stage.queue.pop(slot);
+    if (stage.name == "blur_stage" && result) {
+        std::cout << "[POP] blur_stage popped slot " << slot << std::endl;
+    }
+    if (result) {
+        stage.queue_depth.fetch_sub(1, std::memory_order_relaxed);
+    }
+    return result;
 }
 
 inline void ema_update(std::atomic<long long>& ema_ns, long long sample_ns) {
@@ -479,122 +484,123 @@ void free_slot_list(const std::vector<int>& slots) {
 inline void set_single_output_meta(Frame& f, const std::string& stage_name) {
     f.meta.branch_id = 0;
     f.meta.expected_branches = 1;
-    f.meta.source_stage = stage_name;
+    f.meta.source_stage = stage_name.c_str();
 }
 
-void push_reorder_item(const OrderedOutputItem& item) {
-    while (!reorder_queue.push(item)) std::this_thread::yield();
-    reorder_queue_count.fetch_add(1, std::memory_order_relaxed);
-}
-
-bool pop_reorder_item(OrderedOutputItem& item) {
-    if (!reorder_queue.pop(item)) return false;
-    reorder_queue_count.fetch_sub(1, std::memory_order_relaxed);
-    return true;
-}
-
-struct ReorderSlot {
-    std::atomic<uint64_t> seq;
-    uint64_t frame_id;
-    uint64_t created_ns;
-    ReorderSlot() : seq(std::numeric_limits<uint64_t>::max()), frame_id(0), created_ns(0) {}
-};
-
-// ================= REORDER WRITER =================
-void reorder_writer_loop() {
-    std::ofstream file("order.txt", std::ios::out | std::ios::trunc);
-    if (!file.is_open()) {
-        std::cerr << "[ORDER] Cannot open order.txt for writing\n";
-        return;
+// ================= REORDER WORKER FOR TERMINAL STAGE =================
+void reorder_worker_for_stage(Stage& stage) {
+    constexpr size_t REORDER_CAP = 4096;
+    struct PendingSlot {
+        std::atomic<uint64_t> seq;
+        int slot;
+        uint64_t frame_id;
+        uint64_t created_ns;
+    };
+    std::cout << "[REORDER] Thread started for stage: " << stage.name << std::endl;
+    std::array<PendingSlot, REORDER_CAP> pending;
+    for (auto& p : pending) {
+        p.seq.store(UINT64_MAX, std::memory_order_relaxed);
+        p.slot = -1;
     }
-
-    std::array<ReorderSlot, REORDER_CAP> pending;
-    for (auto& s : pending) {
-        s.seq.store(std::numeric_limits<uint64_t>::max(), std::memory_order_relaxed);
-        s.frame_id = 0;
-        s.created_ns = 0;
-    }
-
-    const uint64_t EMPTY = std::numeric_limits<uint64_t>::max();
+    const uint64_t EMPTY = UINT64_MAX;
     uint64_t next_seq_to_write = 0;
 
-    auto emit = [&](uint64_t seq, uint64_t frame_id, uint64_t created_ns) {
-        const uint64_t now_ns = steady_now_ns();
-        const uint64_t e2e_ns = (created_ns > 0 && now_ns >= created_ns) ? (now_ns - created_ns) : 0;
-        g_e2e_latency_ns.add(e2e_ns);
-
-        file << seq << "," << frame_id << "," << created_ns << "," << std::fixed << std::setprecision(3)
-             << ns_to_ms(e2e_ns) << "\n";
-
-        completed_frames.fetch_add(1, std::memory_order_relaxed);
-
-        if ((seq & 63ULL) == 63ULL) {
-            file.flush();
+    auto emit = [&](uint64_t seq, int slot, uint64_t created_ns) {
+        Frame& frame = buffer[slot];
+        if (stage.plugin.api && stage.plugin.api->process) {
+            ProcessContext ctx;
+            ctx.meta = &frame.meta;
+            ctx.stage_name = stage.name.c_str();
+            // Вызываем новую версию process
+            stage.plugin.api->process(frame.mat, &ctx);
+        } else {
+            fail_fast_drop("terminal_no_process", frame.meta.frame_id, seq);
         }
+        push_free_slot(slot);
+        completed_frames.fetch_add(1, std::memory_order_relaxed);
+        stage.processed_total.fetch_add(1, std::memory_order_relaxed);
+        // Можно добавить метрику времени обработки терминальной стадии
     };
 
     auto flush_ready = [&]() {
-        for (;;) {
-            const size_t idx = static_cast<size_t>(next_seq_to_write & (REORDER_CAP - 1));
-            const uint64_t stored = pending[idx].seq.load(std::memory_order_acquire);
+        while (true) {
+            size_t idx = next_seq_to_write & (REORDER_CAP - 1);
+            uint64_t stored = pending[idx].seq.load(std::memory_order_acquire);
             if (stored != next_seq_to_write) break;
-
-            const uint64_t frame_id = pending[idx].frame_id;
-            const uint64_t created_ns = pending[idx].created_ns;
+            emit(next_seq_to_write, pending[idx].slot, pending[idx].created_ns);
             pending[idx].seq.store(EMPTY, std::memory_order_release);
-
-            emit(next_seq_to_write, frame_id, created_ns);
             ++next_seq_to_write;
         }
     };
 
-    while (true) {
+    while (!stage.reorder_stop.load(std::memory_order_relaxed)) {
         OrderedOutputItem item;
-        if (!pop_reorder_item(item)) {
+        if (!stage.output_queue.pop(item)) {
             std::this_thread::sleep_for(std::chrono::microseconds(50));
             continue;
         }
-
         if (item.global_seq < next_seq_to_write) {
+            // устаревший кадр – просто освобождаем слот
+            push_free_slot(item.slot);
             continue;
         }
-
         if (item.global_seq == next_seq_to_write) {
-            emit(item.global_seq, item.frame_id, item.created_ns);
+            emit(item.global_seq, item.slot, item.created_ns);
             ++next_seq_to_write;
             flush_ready();
             continue;
         }
-
-        const size_t idx = static_cast<size_t>(item.global_seq & (REORDER_CAP - 1));
-        for (;;) {
-            const uint64_t cur = pending[idx].seq.load(std::memory_order_acquire);
+        size_t idx = item.global_seq & (REORDER_CAP - 1);
+        while (true) {
+            uint64_t cur = pending[idx].seq.load(std::memory_order_acquire);
             if (cur == EMPTY || cur == item.global_seq) break;
             std::this_thread::yield();
         }
-
+        pending[idx].slot = item.slot;
         pending[idx].frame_id = item.frame_id;
         pending[idx].created_ns = item.created_ns;
         pending[idx].seq.store(item.global_seq, std::memory_order_release);
-
         flush_ready();
     }
 }
 
+// ================= FORWARD AFTER STAGE =================
 void forward_after_stage(Stage& stage, int slot) {
     if (stage.next_stages.empty()) {
+        // Терминальная стадия – отправляем в её собственный реордерер
         OrderedOutputItem item;
         item.global_seq = buffer[slot].meta.global_seq;
         item.frame_id = buffer[slot].meta.frame_id;
         item.created_ns = buffer[slot].meta.created_ns;
-        push_reorder_item(item);
-        push_free_slot(slot);
+        item.slot = slot;
+        while (!stage.output_queue.push(item)) {
+            std::this_thread::yield();
+        }
+        // слот НЕ освобождается – он будет освобождён реордерером
         return;
     }
 
     if (stage.next_stages.size() == 1) {
-        buffer[slot].meta.source_stage = stage.name;
-        push_stage_slot(*stage.next_stages[0], slot);
+        Stage* next = stage.next_stages[0];
+        std::cout << "[FORWARD] " << stage.name << " -> " << next->name 
+              << " (next->next_stages.empty()=" << next->next_stages.empty() << ")" << std::endl;
+        buffer[slot].meta.source_stage = stage.name.c_str();
+        std::cout << "[forward] stage " << stage.name << " forwarding slot " << slot << " to " << next->name << std::endl;
+        if (next->next_stages.empty()) {
+            // Терминальная стадия – отправляем в её output_queue
+            OrderedOutputItem item;
+            item.global_seq = buffer[slot].meta.global_seq;
+            item.frame_id = buffer[slot].meta.frame_id;
+            item.created_ns = buffer[slot].meta.created_ns;
+            item.slot = slot;
+            while (!next->output_queue.push(item)) {
+                std::this_thread::yield();
+            }
+            // Слот НЕ освобождается – будет освобождён реордерером
+        } else {
+            std::cout << "[forward] show_stage pushing slot " << slot << " to blur_stage" << std::endl;
+            push_stage_slot(*next, slot);
+        }
         return;
     }
 
@@ -612,7 +618,7 @@ void forward_after_stage(Stage& stage, int slot) {
     buffer[slot].meta.split_id = split_id;
     buffer[slot].meta.branch_id = 0;
     buffer[slot].meta.expected_branches = static_cast<uint16_t>(branch_count);
-    buffer[slot].meta.source_stage = stage.name;
+    buffer[slot].meta.source_stage = stage.name.c_str();
 
     std::vector<int> out_slots(branch_count, -1);
     out_slots[0] = slot;
@@ -623,18 +629,32 @@ void forward_after_stage(Stage& stage, int slot) {
         buffer[out_slots[i]].meta = buffer[slot].meta;
         buffer[out_slots[i]].meta.branch_id = static_cast<uint16_t>(i);
         buffer[out_slots[i]].meta.expected_branches = static_cast<uint16_t>(branch_count);
-        buffer[out_slots[i]].meta.source_stage = stage.name;
+        buffer[out_slots[i]].meta.source_stage = stage.name.c_str();
     }
 
     buffer[slot].meta.branch_id = 0;
     buffer[slot].meta.expected_branches = static_cast<uint16_t>(branch_count);
-    buffer[slot].meta.source_stage = stage.name;
+    buffer[slot].meta.source_stage = stage.name.c_str();
 
     for (size_t i = 0; i < branch_count; ++i) {
-        push_stage_slot(*stage.next_stages[i], out_slots[i]);
+        Stage* next = stage.next_stages[i];
+        if (next->next_stages.empty()) {
+            OrderedOutputItem item;
+            item.global_seq = buffer[out_slots[i]].meta.global_seq;
+            item.frame_id = buffer[out_slots[i]].meta.frame_id;
+            item.created_ns = buffer[out_slots[i]].meta.created_ns;
+            item.slot = out_slots[i];
+            while (!next->output_queue.push(item)) {
+                std::this_thread::yield();
+            }
+            // Слот не освобождается – будет освобождён реордерером
+        } else {
+            push_stage_slot(*next, out_slots[i]);
+        }
     }
 }
 
+// ================= MERGE HELPER =================
 std::vector<int> cleanup_stale_merges(Stage& stage, uint64_t now_ns) {
     std::vector<int> stale_slots;
 
@@ -772,6 +792,14 @@ RuntimeConfig load_config(const std::string& path, std::vector<StageSpec>& stage
     cfg.cpu_ids.reserve(cfg.logical_cpus);
     for (int i = 0; i < cfg.logical_cpus; ++i) {
         cfg.cpu_ids.push_back(i);
+    }
+
+    if (j.contains("ipconfig")) {
+        const auto& jip = j.at("ipconfig");
+        cfg.ip = jip.value("ip", cfg.ip);
+        cfg.port = jip.value("port", cfg.port);
+        cfg.protocol = jip.value("protocol", cfg.protocol);
+        cfg.socket_type = jip.value("socket_type", cfg.socket_type);
     }
 
     if (!j.contains("stages") || !j.at("stages").is_array()) {
@@ -923,13 +951,6 @@ Pipeline build_pipeline(const RuntimeConfig& cfg, const std::vector<StageSpec>& 
 }
 
 // ================= METRICS EXPORT =================
-struct StageSnapshot {
-    long long processed = 0;
-    long long time_ns = 0;
-    std::vector<uint64_t> process_lat_ns;
-    std::vector<uint64_t> queue_wait_lat_ns;
-};
-
 void metrics_server_loop(const std::string& csv_filename) {
     std::ofstream file(csv_filename, std::ios::out);
     if (!file.is_open()) {
@@ -1036,7 +1057,7 @@ void metrics_server_loop(const std::string& csv_filename) {
                       << " | Output FPS: " << output_fps
                       << " | Free slots: " << current_free_slots
                       << " | Dropped: " << dropped_frames.load(std::memory_order_relaxed)
-                      << " | ReorderQ: " << reorder_queue_count.load(std::memory_order_relaxed)
+                      << " | ReorderQ: 0 (per-stage buffers)"   // старый глобальный удалён
                       << " | Workers:";
             for (const Stage* s : g_pipeline_stages) {
                 std::cout << " " << s->name << "=" << s->worker_count.load(std::memory_order_relaxed);
@@ -1051,7 +1072,7 @@ void metrics_server_loop(const std::string& csv_filename) {
              << current_completed << ","
              << current_free_slots << "," << free_slots_min << ","
              << dropped_frames.load(std::memory_order_relaxed) << ","
-             << reorder_queue_count.load(std::memory_order_relaxed)
+             << 0  // старый reorder_queue_count удалён
              << "," << std::setprecision(3)
              << e2e_stats.avg_ms << "," << e2e_stats.p50_ms << "," << e2e_stats.p95_ms << ","
              << e2e_stats.p99_ms << "," << e2e_stats.max_ms << ","
@@ -1102,17 +1123,18 @@ void metrics_server_loop(const std::string& csv_filename) {
 
 // ================= WORKERS =================
 void worker_loop(Stage& stage, int cpu_id) {
+
     pin_current_thread_to_cpu(cpu_id);
 
     const bool has_process = (stage.plugin.api && stage.plugin.api->process);
     const bool has_merge = (stage.plugin.api && stage.plugin.api->merge);
 
     if (stage.kind == "normal" && !has_process) {
-        std::cerr << "[FATAL] stage process() is null for stage: " << stage.name << "\n";
+        std::cerr << "[FATAL] stage process() is null for stage: " << stage.name.c_str() << "\n";
         return;
     }
     if (stage.kind == "merge" && !has_merge) {
-        std::cerr << "[FATAL] stage merge() is null for stage: " << stage.name << "\n";
+        std::cerr << "[FATAL] stage merge() is null for stage: " << stage.name.c_str() << "\n";
         return;
     }
 
@@ -1123,7 +1145,18 @@ void worker_loop(Stage& stage, int cpu_id) {
             std::this_thread::sleep_for(std::chrono::microseconds(50));
             continue;
         }
-
+        if (stage.name == "show_stage") {
+            static int show_calls = 0;
+            if (++show_calls % 100 == 0) {
+                std::cout << "[worker_loop] show_stage processing slot " << slot << std::endl;
+            }
+        }
+        if (stage.name == "blur_stage") {
+            static int blur_calls = 0;
+            if (++blur_calls % 100 == 0) {
+                std::cout << "[worker_loop] blur_stage processing slot " << slot << std::endl;
+            }
+        }
         const uint64_t dequeue_ns = steady_now_ns();
         const uint64_t queue_enter_ns = buffer[slot].meta.queue_enter_ns;
         if (queue_enter_ns > 0 && dequeue_ns >= queue_enter_ns) {
@@ -1137,7 +1170,10 @@ void worker_loop(Stage& stage, int cpu_id) {
 
             if (incoming_meta.expected_branches <= 1) {
                 if (has_process) {
-                    stage.plugin.api->process(buffer[slot].mat);
+                    ProcessContext ctx;
+                    ctx.meta = &buffer[slot].meta;
+                    ctx.stage_name = stage.name.c_str();
+                    stage.plugin.api->process(buffer[slot].mat, &ctx);
                 }
 
                 stage.processed_total.fetch_add(1, std::memory_order_relaxed);
@@ -1201,7 +1237,7 @@ void worker_loop(Stage& stage, int cpu_id) {
 
             buffer[res.base_slot].meta.branch_id = 0;
             buffer[res.base_slot].meta.expected_branches = 1;
-            buffer[res.base_slot].meta.source_stage = stage.name;
+            buffer[res.base_slot].meta.source_stage = stage.name.c_str();
 
             const auto end = std::chrono::high_resolution_clock::now();
             const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
@@ -1213,7 +1249,10 @@ void worker_loop(Stage& stage, int cpu_id) {
             continue;
         }
 
-        stage.plugin.api->process(buffer[slot].mat);
+        ProcessContext ctx;
+        ctx.meta = &buffer[slot].meta;
+        ctx.stage_name = stage.name.c_str();
+        stage.plugin.api->process(buffer[slot].mat, &ctx);
 
         stage.processed_total.fetch_add(1, std::memory_order_relaxed);
         const auto end = std::chrono::high_resolution_clock::now();
@@ -1235,14 +1274,14 @@ bool spawn_worker(Stage& stage) {
     try {
         std::thread(worker_loop, std::ref(stage), cpu_id).detach();
     } catch (const std::exception& e) {
-        std::cerr << "[WARN] Failed to spawn worker for stage " << stage.name << ": " << e.what() << "\n";
+        std::cerr << "[WARN] Failed to spawn worker for stage " << stage.name.c_str() << ": " << e.what() << "\n";
         return false;
     }
 
     stage.worker_count.fetch_add(1, std::memory_order_relaxed);
     g_total_runtime_workers.fetch_add(1, std::memory_order_relaxed);
 
-    std::cout << "[AUTO-SCALE] " << stage.name
+    std::cout << "[AUTO-SCALE] " << stage.name.c_str()
               << " -> workers=" << stage.worker_count.load(std::memory_order_relaxed) << "\n";
     return true;
 }
@@ -1354,20 +1393,14 @@ int main(int argc, char** argv) {
             }
         }
 
-        // Создаём папку results, если её нет
         std::filesystem::create_directory("results");
-
-        // Получаем чистое имя конфига без расширения и пути
         std::filesystem::path config_file(config_path);
         std::string base_name = config_file.stem().string();
 
-        // Формируем метку времени
         auto now = std::chrono::system_clock::now();
         auto in_time_t = std::chrono::system_clock::to_time_t(now);
         std::stringstream ts;
         ts << std::put_time(std::localtime(&in_time_t), "_%Y%m%d_%H%M%S");
-
-        // Итоговый путь в папке results
         std::string metrics_path = "results/" + base_name + ts.str() + ".csv";
 
         std::vector<StageSpec> stage_specs;
@@ -1392,18 +1425,20 @@ int main(int argc, char** argv) {
 
         free_slots_count.store(g_cfg.buffer_size, std::memory_order_relaxed);
         for (int i = 0; i < g_cfg.buffer_size; ++i) {
-            while (!free_slots.push(i)) {
-                std::this_thread::yield();
-            }
+            while (!free_slots.push(i)) std::this_thread::yield();
         }
 
-        for (Stage* stage : g_pipeline_stages) {
-            start_initial_workers(*stage);
+        for (Stage* s : g_pipeline_stages) {
+            if (s->next_stages.empty()) {
+                std::cout << "[MAIN] Starting reorder thread for terminal stage: " << s->name << std::endl;
+                s->reorder_thread = std::make_unique<std::thread>(reorder_worker_for_stage, std::ref(*s));
+            }else {
+                start_initial_workers(*s);
+            }
         }
 
         std::thread(autoscaler_loop, g_pipeline_stages).detach();
         std::thread(metrics_server_loop, metrics_path).detach();
-        std::thread(reorder_writer_loop).detach();
 
         std::cout << "Loaded pipeline from: " << config_path << "\n";
         std::cout << "Metrics file: " << metrics_path << "\n";
@@ -1431,7 +1466,7 @@ int main(int argc, char** argv) {
                     }
                     std::cout << "]";
                 } else {
-                    std::cout << " | next=[]";
+                    std::cout << " | next=[] (terminal)";
                 }
                 std::cout << "\n";
             }
@@ -1441,7 +1476,9 @@ int main(int argc, char** argv) {
 
         zmq::context_t ctx(1);
         zmq::socket_t sock(ctx, zmq::socket_type::pull);
-        sock.connect("tcp://127.0.0.1:5558");
+        std::string connect_addr = g_cfg.protocol + "://" + g_cfg.ip + ":" + std::to_string(g_cfg.port);
+        sock.connect(connect_addr);
+        std::cout << "Connecting to ZMQ source at " << connect_addr << "\n";
 
         std::cout << "Expected frame size: "
                   << g_cfg.frame_h << " x " << g_cfg.frame_w
@@ -1515,6 +1552,7 @@ int main(int argc, char** argv) {
 
             input_frames.fetch_add(1, std::memory_order_relaxed);
             push_stage_slot(*g_pipeline_stages.front(), slot);
+            std::cout << "[MAIN] Pushed slot " << slot << " to first stage: " << g_pipeline_stages.front()->name << std::endl;
         }
 
     } catch (const std::exception& e) {

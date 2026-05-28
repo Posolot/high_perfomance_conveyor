@@ -1,66 +1,72 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import json
-from pathlib import Path
-import subprocess
-import psutil
-from Src.Logics.Pipeline_parser import PipelineParser
+import uvicorn
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 
-app = FastAPI()
-
-PIPELINE_EXECUTABLE = Path(__file__).parent.parent / "pipeline"
-CONFIG_JSON_PATH = Path(__file__).parent.parent / "config.json"
-LOG_PATH = Path(__file__).parent.parent / "pipeline.txt"
-
-current_pipeline_proc: subprocess.Popen | None = None
-
-class PipelineRequest(BaseModel):
-    config: dict
-
-@app.post("/new_schema")
-def new_schema_pipeline(request: PipelineRequest):
-    global current_pipeline_proc
-    parser = PipelineParser()
-
-    try:
-        if not LOG_PATH.exists():
-            LOG_PATH.touch()
-        # Убийство конвейера прошлой конфигурации
-        if current_pipeline_proc and psutil.pid_exists(current_pipeline_proc.pid):
-            proc = psutil.Process(current_pipeline_proc.pid)
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except psutil.TimeoutExpired:
-                proc.kill()
-            current_pipeline_proc = None
-
-        pipeline = parser.parse(json.dumps(request.config))
-        cpp_ready = parser.pipeline_for_cpp(pipeline)
-
-        with open(CONFIG_JSON_PATH, "w") as f:
-            json.dump(cpp_ready, f, indent=1)
-            f.flush()
-
-        log_file = open(LOG_PATH, "a")
-
-        current_pipeline_proc = subprocess.Popen(
-            [str(PIPELINE_EXECUTABLE)],
-            stdout=log_file,
-            stderr=log_file,
-            cwd=PIPELINE_EXECUTABLE.parent
-        )
+from Src.Core.constans import API_PREFIX, APP_NAME, APP_VERSION, DEFAULT_HOST, DEFAULT_PORT
+from Src.Core.validator import ConfigValidationError
+from Src.Core.responces import ErrorResponse
+from Src.Routers.config_router import router as config_router
+from Src.Routers.pipeline_router import router as pipeline_router
+from Src.Routers.section_router import router as section_router
+from Src.Routers.dashboard_router import router as dashboard_router
+app = FastAPI(
+    title=APP_NAME,
+    version=APP_VERSION,
+)
 
 
-        alive = psutil.pid_exists(current_pipeline_proc.pid)
+@app.exception_handler(ConfigValidationError)
+async def config_validation_exception_handler(request: Request, exc: ConfigValidationError):
+    return JSONResponse(
+        status_code=400,
+        content=exc.to_dict(),
+    )
 
-        return {
-            "status": "new pipeline started" if alive else "failed to start pipeline",
-            "file": str(CONFIG_JSON_PATH),
-            "log": str(LOG_PATH),
-            "pid": current_pipeline_proc.pid,
-            "alive": alive
-        }
 
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=422,
+        content=ErrorResponse(
+            ok=False,
+            error_type="REQUEST_VALIDATION_ERROR",
+            error_code=4000,
+            message="Invalid request payload",
+            details={"errors": exc.errors()},
+        ).model_dump(),
+    )
+
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content=ErrorResponse(
+            ok=False,
+            error_type="INTERNAL_SERVER_ERROR",
+            error_code=5000,
+            message=str(exc),
+            details={},
+        ).model_dump(),
+    )
+
+
+app.include_router(section_router, prefix=API_PREFIX)
+app.include_router(config_router, prefix=API_PREFIX)
+app.include_router(pipeline_router, prefix=API_PREFIX)
+app.include_router(dashboard_router)
+
+@app.get("/")
+def root():
+    return {
+        "message": "Conveyor API",
+        "docs": "/docs",
+        "openapi": "/openapi.json",
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("main:app", host="0.0.0.0", port=8080, reload=True)

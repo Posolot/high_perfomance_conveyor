@@ -2,13 +2,13 @@
 #include <opencv2/imgproc.hpp>
 
 static void process(cv::Mat& frame, const ProcessContext* ctx) {
-    (void)ctx; // метаданные пока не используются, но могут быть полезны в будущем
+    (void)ctx;
     if (frame.empty()) return;
-    frame.setTo(cv::Scalar(255, 255, 255));
-    if (count++ % 100 == 0) {
-        std::cerr << "[blur_plugin] process called, frame size: " 
-                  << frame.cols << "x" << frame.rows << std::endl;
-    }
+    cv::Mat blurred, edges;
+    cv::GaussianBlur(frame, blurred, {7, 7}, 1.8);
+    cv::Canny(blurred, edges, 80, 160);
+    static const cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, {3, 3});
+    cv::dilate(edges, frame, kernel);
 }
 
 extern "C" StagePluginV3* stage_plugin_entry() {

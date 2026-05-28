@@ -57,19 +57,19 @@
       "name": "merge_stage",
       "callable": "merge",
       "next": [
-        "heavy_stage"
+        "show_stage"
       ],
       "initial_workers": 1,
       "min_workers": 1,
       "max_workers": 10
     },
     {
-      "name": "heavy_stage",
-      "callable": "heavy",
+      "name": "show_stage",
+      "callable": "show",
       "next": [],
-      "initial_workers": 2,
-      "min_workers": 2,
-      "max_workers": 10
+      "initial_workers": 1,
+      "min_workers": 1,
+      "max_workers": 1
     }
   ]
 }

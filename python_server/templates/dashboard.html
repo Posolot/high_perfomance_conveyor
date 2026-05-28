@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Conveyor Dashboard</title>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <style>
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: #0f1115;
+      color: #e7eaf0;
+    }
+    .wrap {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+    .topbar {
+      display: flex;
+      gap: 16px;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 16px;
+      flex-wrap: wrap;
+    }
+    .card {
+      background: #171a21;
+      border: 1px solid #2a2f3a;
+      border-radius: 14px;
+      padding: 12px 14px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 16px;
+    }
+    .plot {
+      width: 100%;
+      height: 360px;
+    }
+    .small {
+      font-size: 13px;
+      color: #aab2c0;
+    }
+    @media (min-width: 1100px) {
+      .grid {
+        grid-template-columns: 1fr 1fr;
+      }
+      .wide {
+        grid-column: 1 / -1;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="topbar">
+      <div>
+        <h2 style="margin:0 0 6px 0;">Conveyor dashboard</h2>
+        <div class="small" id="status">Loading...</div>
+      </div>
+      <div class="card small" id="meta">Waiting for data...</div>
+    </div>
+
+    <div class="grid">
+      <div class="card wide">
+        <div id="queueChart" class="plot"></div>
+      </div>
+
+      <div class="card wide">
+        <div id="fpsChart" class="plot"></div>
+      </div>
+
+      <div class="card">
+        <div id="bufferChart" class="plot"></div>
+      </div>
+
+      <div class="card">
+        <div id="timeChart" class="plot"></div>
+      </div>
+    </div>
+  </div>
+
+<script>
+const dashboardState = {
+  initialized: false,
+  lastTimestamp: 0,
+  stageNames: [],
+  maxPoints: 200
+};
+
+async function fetchMetrics() {
+  const res = await fetch('/api/dashboard/metrics', { cache: 'no-store' });
+  return await res.json();
+}
+
+function asNumber(v) {
+  if (v === null || v === undefined || v === '') return 0;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function tsToX(tsValues) {
+  return tsValues.map(v => {
+    const n = asNumber(v);
+    return new Date(n / 1e6);
+  });
+}
+
+function buildTraces(rows, stageNames, suffix) {
+  const x = tsToX(rows.map(r => r.timestamp));
+  return stageNames.map(name => {
+    const key = `${name}${suffix}`;
+    return {
+      x,
+      y: rows.map(r => asNumber(r[key])),
+      mode: 'lines+markers',
+      name
+    };
+  });
+}
+
+function initQueueChart(rows, stageNames) {
+  const traces = buildTraces(rows, stageNames, '_queue_depth');
+  Plotly.newPlot('queueChart', traces, {
+    title: 'Очередь по стадиям',
+    paper_bgcolor: '#171a21',
+    plot_bgcolor: '#171a21',
+    font: { color: '#e7eaf0' },
+    xaxis: { title: 'time' },
+    yaxis: { title: 'queue depth' },
+    margin: { l: 55, r: 20, t: 50, b: 45 }
+  }, { responsive: true });
+}
+
+function initFpsChart(rows) {
+  const x = tsToX(rows.map(r => r.timestamp));
+  const inputFps = rows.map(r => asNumber(r.input_fps));
+  const outputFps = rows.map(r => asNumber(r.output_fps));
+
+  Plotly.newPlot('fpsChart', [
+    { x, y: inputFps, mode: 'lines+markers', name: 'input_fps' },
+    { x, y: outputFps, mode: 'lines+markers', name: 'output_fps' }
+  ], {
+    title: 'FPS',
+    paper_bgcolor: '#171a21',
+    plot_bgcolor: '#171a21',
+    font: { color: '#e7eaf0' },
+    xaxis: { title: 'time' },
+    yaxis: { title: 'fps' },
+    margin: { l: 55, r: 20, t: 50, b: 45 }
+  }, { responsive: true });
+}
+
+function initBufferChart(rows, bufferSize) {
+  const x = tsToX(rows.map(r => r.timestamp));
+  const freeSlots = rows.map(r => asNumber(r.free_slots));
+  const usedSlots = bufferSize ? freeSlots.map(v => Math.max(bufferSize - v, 0)) : freeSlots;
+
+  Plotly.newPlot('bufferChart', [
+    { x, y: usedSlots, mode: 'lines+markers', name: 'used slots' },
+    { x, y: freeSlots, mode: 'lines+markers', name: 'free slots' }
+  ], {
+    title: 'Заполненность буфера',
+    paper_bgcolor: '#171a21',
+    plot_bgcolor: '#171a21',
+    font: { color: '#e7eaf0' },
+    xaxis: { title: 'time' },
+    yaxis: { title: 'slots' },
+    margin: { l: 55, r: 20, t: 50, b: 45 }
+  }, { responsive: true });
+}
+
+function initTimeChart(rows, stageNames) {
+  const traces = buildTraces(rows, stageNames, '_proc_avg_ms');
+  Plotly.newPlot('timeChart', traces, {
+    title: 'Среднее время на стадию',
+    paper_bgcolor: '#171a21',
+    plot_bgcolor: '#171a21',
+    font: { color: '#e7eaf0' },
+    xaxis: { title: 'time' },
+    yaxis: { title: 'ms' },
+    margin: { l: 55, r: 20, t: 50, b: 45 }
+  }, { responsive: true });
+}
+
+function appendToChart(chartId, traceIndices, xNew, yNewByTrace) {
+  const update = {
+    x: [],
+    y: []
+  };
+
+  for (let i = 0; i < traceIndices.length; i++) {
+    update.x.push([xNew]);
+    update.y.push([yNewByTrace[i]]);
+  }
+
+  Plotly.extendTraces(chartId, update, traceIndices, dashboardState.maxPoints);
+}
+
+function drawInitialCharts(payload) {
+  const rows = payload.rows || [];
+  const stageNames = payload.stage_names || [];
+  const bufferSize = payload.buffer_size || null;
+
+  dashboardState.stageNames = stageNames;
+  dashboardState.lastTimestamp = rows.length ? asNumber(rows[rows.length - 1].timestamp) : 0;
+
+  initQueueChart(rows, stageNames);
+  initFpsChart(rows);
+  initBufferChart(rows, bufferSize);
+  initTimeChart(rows, stageNames);
+
+  dashboardState.initialized = true;
+}
+
+function extendCharts(newRows, bufferSize) {
+  if (!newRows.length) return;
+
+  const stageNames = dashboardState.stageNames;
+  const xNew = new Date(asNumber(newRows[newRows.length - 1].timestamp) / 1e6);
+
+  const queueY = stageNames.map(name =>
+    asNumber(newRows[newRows.length - 1][`${name}_queue_depth`])
+  );
+
+  const fpsInput = asNumber(newRows[newRows.length - 1].input_fps);
+  const fpsOutput = asNumber(newRows[newRows.length - 1].output_fps);
+
+  const freeSlots = asNumber(newRows[newRows.length - 1].free_slots);
+  const usedSlots = bufferSize ? Math.max(bufferSize - freeSlots, 0) : freeSlots;
+
+  const timeY = stageNames.map(name =>
+    asNumber(newRows[newRows.length - 1][`${name}_proc_avg_ms`])
+  );
+
+  appendToChart(
+    'queueChart',
+    stageNames.map((_, i) => i),
+    xNew,
+    queueY
+  );
+
+  appendToChart(
+    'fpsChart',
+    [0, 1],
+    xNew,
+    [fpsInput, fpsOutput]
+  );
+
+  appendToChart(
+    'bufferChart',
+    [0, 1],
+    xNew,
+    [usedSlots, freeSlots]
+  );
+
+  appendToChart(
+    'timeChart',
+    stageNames.map((_, i) => i),
+    xNew,
+    timeY
+  );
+}
+
+function drawCharts(payload) {
+  const rows = payload.rows || [];
+  const bufferSize = payload.buffer_size || null;
+  const last = rows[rows.length - 1] || {};
+
+  const csvName = payload.csv || 'n/a';
+  const configName = payload.config || 'n/a';
+
+  document.getElementById('status').textContent =
+    payload.ok ? 'Live data updated every 2 seconds' : 'No data yet';
+
+  document.getElementById('meta').textContent =
+    `csv: ${csvName} | config: ${configName} | rows: ${rows.length} | ` +
+    `buffer_size: ${bufferSize ?? 'n/a'} | ` +
+    `input_fps: ${asNumber(last.input_fps).toFixed(2)} | ` +
+    `output_fps: ${asNumber(last.output_fps).toFixed(2)}`;
+
+  if (!payload.ok) return;
+
+  if (!dashboardState.initialized) {
+    drawInitialCharts(payload);
+    return;
+  }
+
+  const newRows = rows.filter(r => asNumber(r.timestamp) > dashboardState.lastTimestamp);
+
+  if (newRows.length) {
+    dashboardState.lastTimestamp = asNumber(newRows[newRows.length - 1].timestamp);
+    extendCharts(newRows, bufferSize);
+  }
+}
+
+async function refresh() {
+  try {
+    const data = await fetchMetrics();
+    drawCharts(data);
+  } catch (err) {
+    document.getElementById('status').textContent = 'Failed to load metrics';
+    console.error(err);
+  }
+}
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

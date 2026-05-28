@@ -2,13 +2,14 @@
 #include <opencv2/imgproc.hpp>
 
 static void process(cv::Mat& frame, const ProcessContext* ctx) {
-    (void)ctx; // метаданные пока не используются, но могут быть полезны в будущем
+    (void)ctx;
     if (frame.empty()) return;
-    frame.setTo(cv::Scalar(255, 255, 255));
-    if (count++ % 100 == 0) {
-        std::cerr << "[blur_plugin] process called, frame size: " 
-                  << frame.cols << "x" << frame.rows << std::endl;
-    }
+    cv::Mat grad_x, grad_y, mag;
+    cv::Sobel(frame, grad_x, CV_32F, 1, 0, 3);
+    cv::Sobel(frame, grad_y, CV_32F, 0, 1, 3);
+    cv::magnitude(grad_x, grad_y, mag);
+    cv::normalize(mag, mag, 0, 255, cv::NORM_MINMAX);
+    mag.convertTo(frame, CV_8U);
 }
 
 extern "C" StagePluginV3* stage_plugin_entry() {

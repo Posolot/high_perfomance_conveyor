@@ -10,6 +10,12 @@
     "logical_cpus": 8,
     "cpu_budget": 8
   },
+  "ipconfig": {
+    "ip": "127.0.0.1",
+    "port": 5558,
+    "protocol": "tcp",
+    "socket_type": "PULL"
+  },
   "stages": [
     {
       "name": "gray_stage",
