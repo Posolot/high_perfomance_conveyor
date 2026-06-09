@@ -9,4 +9,4 @@ test_data/
 order.txt
 .idea/
 .env
-.env.local
+.env.local*.zip

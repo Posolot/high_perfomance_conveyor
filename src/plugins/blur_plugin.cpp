@@ -4,7 +4,7 @@
 static void process(cv::Mat& frame, const ProcessContext* ctx) {
     (void)ctx;
     if (frame.empty()) return;
-    cv::GaussianBlur(frame, frame, {5, 5}, 1.5);
+    cv::GaussianBlur(frame, frame, {15, 15}, 2.5);
 }
 
 extern "C" StagePluginV3* stage_plugin_entry() {

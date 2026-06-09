@@ -1,21 +1,20 @@
 #include "plugin_api.h"
 #include <iostream>
-#include <map>
+#include <mutex>
 
-static std::map<std::string, bool> windows_created;
+static std::once_flag window_created;
 
 static void process_frame(cv::Mat& frame, const ProcessContext* ctx) {
+    (void)ctx; // метаданные не используются
     if (frame.empty()) {
         std::cerr << "[display_plugin] Empty frame received\n";
         return;
     }
-    const std::string win_name = ctx->stage_name;
-    if (!windows_created[win_name]) {
-        cv::namedWindow(win_name, cv::WINDOW_NORMAL);
-        cv::resizeWindow(win_name, 1920, 1080);
-        windows_created[win_name] = true;
-    }
-    cv::imshow(win_name, frame);
+    std::call_once(window_created, []() {
+        cv::namedWindow("Pipeline Output", cv::WINDOW_NORMAL);
+        cv::resizeWindow("Pipeline Output", 1280, 720);
+    });
+    cv::imshow("Pipeline Output", frame);
     cv::waitKey(1);
 }
 

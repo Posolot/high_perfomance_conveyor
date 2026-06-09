@@ -1,10 +1,10 @@
 {
   "frame": {
-    "width": 1920,
-    "height": 1080,
-    "channels": 1
+    "width": 1280,
+    "height": 720,
+    "channels": 3
   },
-  "buffer_size": 250,
+  "buffer_size": 1000,
   "runtime": {
     "physical_cores": 4,
     "logical_cpus": 8,
@@ -18,23 +18,33 @@
   },
   "stages": [
     {
-      "name": "show_stage",
-      "callable": "show",
+      "name": "gray_stage",
+      "callable": "rgb2gray",
       "next": [
         "blur_stage"],
-      "initial_workers": 1,
-      "min_workers": 1,
-      "max_workers": 1
+      "initial_workers": 2,
+      "min_workers": 2,
+      "max_workers": 4
     },
     {
       "name": "blur_stage",
       "callable": "blur",
       "next": [
+        "save_stage"
+      ],
+      "initial_workers": 2,
+      "min_workers": 2,
+      "max_workers": 4
+    },
+    {
+      "name": "save_stage",
+      "callable": "save",
+      "next": [
         "display_stage"
       ],
       "initial_workers": 1,
       "min_workers": 1,
-      "max_workers": 4
+      "max_workers": 1
     },
     {
       "name": "display_stage",
